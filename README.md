@@ -39,7 +39,7 @@ pyaxmlparser（二进制 AndroidManifest）。
 
 分档的依据不是严重程度，而是**「这条检测为什么有效、能有效多久」**。
 
-### 档一 · 应用自查（9 项）
+### 档一 · 应用自查（14 项）
 
 无需任何权限，与被测 App 自身的能力边界对齐。依据来自 `com.pansoul.fucktsn`
 实际去 patch 的目标类——**它 patch 了什么，就说明被测 App 原本在检查什么**：
@@ -54,12 +54,64 @@ pyaxmlparser（二进制 AndroidManifest）。
 | `sports.safe.a` → `a()/c()` | 模拟位置权限 / 应用列表 | `t1_mock_apps` / `t1_blacklist` |
 | `run.app.utils.n$a` → `c()/d()` | 黑名单 / 位置校验 | `t1_blacklist` / `t1_mock_flag` |
 | `Settings.Secure` | 开发者选项 | `t1_dev_opts` |
+| （本项目新增，非被测方原有） | 已安装的位置干预模块 | `t1_intervention_modules` |
+| （运行时观测，见下） | VPN / 代理痕迹 | `t1_vpn_proxy` |
+| （运行时观测，见下） | 存储与多用户环境 | `t1_storage_integrity` |
+| （抓包分析，见下） | WebView 承载面 | `t1_webview_env` |
+| （抓包分析，见下） | 网络响应篡改痕迹 | `t1_response_tampering` |
+
+最后一项 `t1_intervention_modules` 不对应被测方的任何检测类，是额外补的：
+`fucktsn` 自己就是被安装的 Xposed 模块，**它的存在本身就是可观测项**，
+不需要等它 hook 什么。与 `t1_hook_framework` 的分工见 Tier1Checks 里的注释。
 
 **这一档全部可以被打包绕过**，`com.pansoul.fucktsn` 就是用 15 个 `XC_MethodReplacement`
 逐个返回 `false` 完成的，每个不到 10 行。列出来是为了对齐能力边界，不是因为它有效。
 
 `checkRootBinaries()` 里有一条重要限定：现代 Magisk / KernelSU 能隐藏 su，
 所以查不到 su **不等于**没 root——只能正向定罪，不能反向清白。
+
+包名查询有一条容易踩的坑：Android 11+ 起 `getInstalledPackages` 只返回
+`<queries>` 声明过的包。漏声明一个目标包名，检查会静默返回「未安装」——
+**这是假阴性，不是正常结果**。`isPackageInstalled()` 因此同时走全量列表
+和逐个 `getPackageInfo` 两条路，两条都失败才判定未安装。
+
+### 从运行时观测补的两项
+
+上面表格里后两项不是从 hook 目标反推的，而是**装包运行后从日志读出来的**：
+
+| 观测到的现象 | 推断出的检测手段 | 我方实现 |
+|---|---|---|
+| 日志反复出现 `A resource failed to call CursorWrapperInner.close` | 它用 CursorWrapper 接管 SharedPreferences / SQLite 的读取路径，逐行校验本地数据是否被外部篡改 | `t1_storage_integrity`：次要用户、存储路径异常挂载、活动设备管理员 |
+| native 网络组件（日志 tag `AegonNative`）每次启动读一遍 `proxy` / `secure_dns_mode` / `use_local_ipv6` | 它在判断流量是否被导走——抓包、改服务端返回都依赖这一条 | `t1_vpn_proxy`：系统代理属性、`TYPE_VPN`、虚拟网卡名 |
+
+这两项都只给弱信号分（0.3 / 0.35），不进主界面：VPN 和次要用户本身都很常见，
+单靠它们不能说明任何问题。价值在于和位置异常同时出现时提供旁证。
+
+### 从抓包补的两项
+
+对同一次启动做了抓包（18 条请求全部属于被测 App），链路是：
+静态资源 → 倍推 SDK ×5 → OAuth token 刷新 → 平台身份校验 → H5 主文档。
+
+| 观测到的事实 | 说明什么 | 我方实现 |
+|---|---|---|
+| 跑步功能主体是 H5，由 WebView 加载（`X-Requested-With: 被测包名`） | 位置校验至少一部分发生在 Web 层，不在原生 `LocationManager` | `t1_webview_env` |
+| OAuth token 走**明文 HTTP**，`refresh_token` 在 URL query，响应含学号 | 同网络下任何人可取得完整会话材料；这条链可被拦截改写 | `t1_response_tampering` |
+| `hookOkHttpResponse` 出现在对方的 hook 清单里 | 位置数据经 HTTP 响应传递，H5 响应是独立攻击面 | 同上 |
+
+`t1_response_tampering` 查三件事：用户 CA 证书数量（抓包工具解密必须装根证书）、
+已安装的网络分析工具、已知明文端点。实测在这台设备上准确报出
+「用户 CA 证书 1 张；已安装网络分析工具 com.network.proxy；已安装被测 App」。
+
+### 两个曾稳定误报的检测（已修）
+
+- **VPN 检测**原来用 `activeNetworkInfo.type == TYPE_VPN`。该 API 在 API 29 已废弃，
+  且 VPN 通常不是「活动网络」，在新系统上恒返回 null。同时虚拟网卡兜底没判
+  `isUp`，而 `tunl0`/`gretap0` 在每台 Android 上都存在但状态 DOWN，
+  于是**每一台正常设备都会被报成有 VPN**。改为 `NetworkCapabilities.TRANSPORT_VPN`
+  加 `isUp` 过滤。
+- **存储挂载检测**原来匹配目录路径就报异常，而 `/data/user/0` 和 `/data/data`
+  在每台正常 Android 上都挂着，同样恒命中。改为只在同一路径出现 ≥2 条挂载记录时
+  才报（bind mount / overlayfs 的特征）。
 
 ### 档二 · 交叉验证（7 项）
 
@@ -111,7 +163,7 @@ fix 都拿不到，只要能看到卫星、CN0 有自然涨落，就能反证 GN
 另外，去重键必须带 provider：GPS 与网络可能在同一毫秒各给一个点，
 只比时间会把其中一条当重复丢掉——这是「0 个 GPS 样本」的第二个独立成因。
 
-### 档三 · 样本特征（4 项）
+### 档三 · 样本特征（5 项）
 
 针对已逆向的具体实现缺陷。**命中即高置信，但对方升级后会失效**，因此单列，
 不参与档一/档二的加权，避免过时特征污染整体判定。
@@ -121,6 +173,7 @@ fix 都拿不到，只要能看到卫星、CN0 有自然涨落，就能反证 GN
 | `t3_provider_probe` | `LocationContentProvider` 声明 `exported=true`，query 返回 27 列伪造参数 | 最强：一次 query 即可定性 |
 | `t3_lucifer_probe` | 控制通道 `sendExtraCommand("lucifer", ...)` | 强：系统原生无此命令 |
 | `t3_native_artifacts` | `libnl.so` 用 shadowhook 注入 ART / Sensor HAL | 弱：Java 层可达性有限，封顶 0.6 |
+| `t3_native_depth` | 本进程 maps / mountinfo / root 模块目录的注入痕迹 | 弱：只能看本进程，system_server 与内核层不可见 |
 | `t3_wifi_consistency` | demo 写死 `MyFakeWifi` / `02:00:00:00:00:01` | 中：需 WiFi 权限 |
 
 `t3_provider_probe` 是本项目最强的单点。`com.yinshibai.location` 为了给自家 UI 传状态，
